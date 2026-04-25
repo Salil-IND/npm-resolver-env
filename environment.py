@@ -108,6 +108,8 @@ class Observation:
     current_package_json: str
     npm_error_log: str
     step_count: int
+    structured_state: Dict[str, str]
+    structured_conflicts: List[Dict[str, str]]
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize an Observation into a JSON-friendly dictionary.
@@ -125,6 +127,10 @@ class Observation:
             "current_package_json": self.current_package_json,
             "npm_error_log": self.npm_error_log,
             "step_count": self.step_count,
+            "structured_state": dict(self.structured_state),
+            "structured_conflicts": [
+                dict(conflict) for conflict in self.structured_conflicts
+            ],
         }
 
 
@@ -196,9 +202,11 @@ class NPMResolverEnv:
         self.no_op_penalty = -2
         self.invalid_action_penalty = -5
         self.deletion_penalty = -6
+        self.unnecessary_deletion_penalty = -4
         self.timeout_penalty = -10
         self.timeout_reward_cap = -1
         self.success_reward = 50
+        self.minimal_step_bonus_per_remaining_step = 1
         self.fatal_penalty = -100
         self.registry = {
             "react-dom": {
@@ -372,6 +380,45 @@ class NPMResolverEnv:
 
         return sorted(allowed_packages)
 
+    def _build_version_catalog(self) -> Dict[str, List[str]]:
+        """Build a deterministic catalog of known versions for each package.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Dictionary mapping package names to sorted version lists.
+
+        Behavior:
+            Aggregates versions from scenarios, demo state, registry releases,
+            and peer dependency requirements to support deterministic action
+            masking for all packages in the environment.
+        """
+        version_catalog: Dict[str, set[str]] = {}
+
+        for scenario_group in self.levels.values():
+            for scenario in scenario_group:
+                for package_name, package_version in scenario.items():
+                    version_catalog.setdefault(package_name, set()).add(package_version)
+
+        for package_name, package_version in self.demo_scenario.items():
+            version_catalog.setdefault(package_name, set()).add(package_version)
+
+        for package_name, version_map in self.registry.items():
+            version_catalog.setdefault(package_name, set()).update(version_map.keys())
+            for metadata in version_map.values():
+                for dependency_name, dependency_version in metadata.get(
+                    "requires", {}
+                ).items():
+                    version_catalog.setdefault(dependency_name, set()).add(
+                        dependency_version
+                    )
+
+        return {
+            package_name: sorted(versions, key=self._version_sort_key)
+            for package_name, versions in version_catalog.items()
+        }
+
     def _normalize_registry(
         self, registry_payload: object
     ) -> Dict[str, Dict[str, Dict[str, Dict[str, str]]]]:
@@ -475,6 +522,7 @@ class NPMResolverEnv:
             indices exist for every curriculum level.
         """
         self.allowed_packages = self._build_allowed_packages()
+        self.package_version_catalog = self._build_version_catalog()
         current_indices = getattr(self, "level_indices", {})
         self.level_indices = {
             level_name: max(0, int(current_indices.get(level_name, 0)))
@@ -586,13 +634,17 @@ class NPMResolverEnv:
             `Observation` instance.
 
         Behavior:
-            Guarantees valid JSON in `current_package_json`.
+            Guarantees valid JSON in `current_package_json` while also exposing
+            structured state and structured conflict views.
         """
         observable_state = self._get_observable_state()
+        structured_conflicts = self._extract_conflicts(observable_state)
         return Observation(
             current_package_json=self._safe_json_dumps(observable_state),
             npm_error_log=error_log,
             step_count=self.step_count,
+            structured_state=dict(observable_state),
+            structured_conflicts=[dict(conflict) for conflict in structured_conflicts],
         )
 
     def _build_info(
@@ -665,6 +717,9 @@ class NPMResolverEnv:
         Behavior:
             Updates cumulative counters and appends a JSON-friendly step record.
         """
+        observable_state = self._get_observable_state()
+        state_json = self._safe_json_dumps(observable_state)
+        structured_conflicts = self._extract_conflicts(observable_state)
         self.total_steps += 1
         self.total_reward += reward
         self.current_episode_reward += reward
@@ -675,7 +730,7 @@ class NPMResolverEnv:
                 "step": self.step_count,
                 "level": self.active_level,
                 "scenario_index": self.current_scenario_index,
-                "state": dict(self._get_observable_state()),
+                "state": dict(observable_state),
                 "action": None if action is None else action.to_dict(),
                 "reward": reward,
                 "done": done,
@@ -683,6 +738,7 @@ class NPMResolverEnv:
                 "error_log": error_log,
                 "old_error_count": old_error_count,
                 "new_error_count": new_error_count,
+                "structured_conflicts": [dict(conflict) for conflict in structured_conflicts],
             }
         )
 
@@ -709,8 +765,8 @@ class NPMResolverEnv:
                         self.active_level, "Custom scenario"
                     ),
                     "scenario_index": self.current_scenario_index,
-                    "state": dict(self._get_observable_state()),
-                    "state_json": self._safe_json_dumps(self._get_observable_state()),
+                    "state": dict(observable_state),
+                    "state_json": state_json,
                     "action": action_payload,
                     "reward": reward,
                     "error": error_log,
@@ -718,6 +774,9 @@ class NPMResolverEnv:
                     "remaining_errors": self._count_errors(error_log),
                     "errors_before": old_error_count,
                     "errors_after": new_error_count,
+                    "structured_conflicts": [
+                        dict(conflict) for conflict in structured_conflicts
+                    ],
                     "transition": transition_label,
                     "summary": summary,
                     "resolved": status == "success",
@@ -874,9 +933,13 @@ class NPMResolverEnv:
                 "no_op_penalty": self.no_op_penalty,
                 "invalid_action_penalty": self.invalid_action_penalty,
                 "deletion_penalty": self.deletion_penalty,
+                "unnecessary_deletion_penalty": self.unnecessary_deletion_penalty,
                 "timeout_penalty": self.timeout_penalty,
                 "timeout_reward_cap": self.timeout_reward_cap,
                 "success_reward": self.success_reward,
+                "minimal_step_bonus_per_remaining_step": (
+                    self.minimal_step_bonus_per_remaining_step
+                ),
                 "fatal_penalty": self.fatal_penalty,
             },
         }
@@ -907,11 +970,84 @@ class NPMResolverEnv:
             ),
             "reward_structure": (
                 "Fixed step cost, per-error progress reward, per-error regression "
-                "penalty, no-op penalty, deletion penalty, success bonus, and "
-                "timeout penalty."
+                "penalty, no-op penalty, deletion penalties, success bonus, "
+                "minimal-step bonus, and timeout penalty."
             ),
             "max_steps": self.max_steps,
         }
+
+    def get_action_mask(self) -> Dict[str, List[str]]:
+        """Return the deterministic valid action mask for the current state.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Dictionary mapping package names to sorted valid next-version lists.
+
+        Behavior:
+            Enumerates only valid registry or catalog versions plus permitted
+            deletions, while excluding no-op actions and terminal-state actions.
+        """
+        if self.episode_done or not self._is_valid_state(self.current_state):
+            return {}
+
+        action_mask: Dict[str, List[str]] = {}
+        for package_name in sorted(self.current_state):
+            current_version = self.current_state[package_name]
+            valid_versions: List[str] = []
+            seen_versions = set()
+
+            for candidate_version in self.package_version_catalog.get(package_name, []):
+                if candidate_version == current_version or candidate_version in seen_versions:
+                    continue
+                candidate_action = Action(package_name, candidate_version)
+                next_state, transition_error = self._apply_action_to_state(
+                    self.current_state, candidate_action
+                )
+                if transition_error is None and next_state is not None:
+                    valid_versions.append(candidate_version)
+                    seen_versions.add(candidate_version)
+
+            if package_name not in self.untouchable_packages:
+                delete_action = Action(package_name, "DELETE")
+                next_state, transition_error = self._apply_action_to_state(
+                    self.current_state, delete_action
+                )
+                if transition_error is None and next_state is not None:
+                    valid_versions.append("DELETE")
+
+            if valid_versions:
+                action_mask[package_name] = valid_versions
+
+        return action_mask
+
+    def get_valid_actions(self) -> List[Action]:
+        """Return the current deterministic list of valid environment actions.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Sorted list of `Action` objects.
+
+        Behavior:
+            Expands the action mask into explicit action objects for planners,
+            search algorithms, and RL policy tooling.
+        """
+        valid_actions: List[Action] = []
+        action_mask = self.get_action_mask()
+
+        for package_name in sorted(action_mask):
+            for candidate_version in action_mask[package_name]:
+                valid_actions.append(
+                    Action(
+                        package_to_update=package_name,
+                        new_version=candidate_version,
+                    )
+                )
+
+        return valid_actions
 
     def render_demo_trace(self) -> str:
         """Render the demo trace as a readable multi-line text report.
@@ -982,6 +1118,9 @@ class NPMResolverEnv:
             "scenario_index": self.current_scenario_index,
             "state": dict(self._get_observable_state()),
             "state_json": self._safe_json_dumps(self._get_observable_state()),
+            "structured_conflicts": self._extract_conflicts(
+                self._get_observable_state()
+            ),
             "error_log": self.last_error_log,
         }
 
@@ -1115,6 +1254,17 @@ class NPMResolverEnv:
             Resets per-episode tracking, clears demo trace data, audits the
             supplied scenario, and returns the starting observation.
         """
+        safe_level_name = level_name if level_name == "demo" else self._validate_level(level_name)
+        safe_scenario = (
+            dict(scenario)
+            if self._is_valid_state(scenario)
+            else dict(self.levels["level_1"][0])
+        )
+        if safe_scenario != scenario and safe_level_name != "demo":
+            safe_level_name = "level_1"
+            self.current_scenario_index = 1
+            self._log_debug("Episode start scenario invalid; fell back to level_1.")
+
         self.step_count = 0
         self.last_action = None
         self.last_error_count = 0
@@ -1126,8 +1276,8 @@ class NPMResolverEnv:
         self.debug_logs = []
         self.demo_trace = []
         self.episode_count += 1
-        self.active_level = level_name
-        self.current_state = dict(scenario)
+        self.active_level = safe_level_name
+        self.current_state = dict(safe_scenario)
         self.last_error_log = self._safe_current_error_log()
         self.last_error_count = self._count_errors(self.last_error_log)
         self._log_debug(
@@ -1172,8 +1322,14 @@ class NPMResolverEnv:
         if action.new_version == "DELETE":
             return None
 
+        known_versions = self.package_version_catalog.get(action.package_to_update, [])
+        if not known_versions:
+            return self._format_error("Error", "Unknown package version.")
+
         package_registry = self.registry.get(action.package_to_update)
         if package_registry is None:
+            if action.new_version not in known_versions:
+                return self._format_error("Error", "Unknown package version.")
             return None
 
         if action.new_version not in package_registry:
@@ -1206,6 +1362,39 @@ class NPMResolverEnv:
         except ValueError:
             return None
 
+    def _version_sort_key(self, version: str) -> Tuple[int, int, int, int, str]:
+        """Build a deterministic sort key for environment version strings.
+
+        Inputs:
+            version: Version string to order.
+
+        Outputs:
+            Tuple suitable for stable sorting.
+
+        Behavior:
+            Orders semantic versions numerically while placing `DELETE` last.
+        """
+        if version == "DELETE":
+            return (10**6, 10**6, 10**6, 10**6, version)
+
+        cleaned_version = version[1:] if version.startswith("^") else version
+        parts = cleaned_version.split(".")
+        numeric_parts: List[int] = []
+        for index in range(3):
+            try:
+                numeric_parts.append(int(parts[index]))
+            except (IndexError, TypeError, ValueError):
+                numeric_parts.append(10**6)
+
+        prefix_rank = 1 if version.startswith("^") else 0
+        return (
+            numeric_parts[0],
+            numeric_parts[1],
+            numeric_parts[2],
+            prefix_rank,
+            version,
+        )
+
     def is_compatible(self, required: str, actual: str) -> bool:
         """Evaluate lightweight npm-style compatibility between two versions.
 
@@ -1233,6 +1422,55 @@ class NPMResolverEnv:
 
         return required_major == actual_major
 
+    def _extract_conflicts(self, dependencies: Dict[str, str]) -> List[Dict[str, str]]:
+        """Extract structured dependency conflicts from a dependency mapping.
+
+        Inputs:
+            dependencies: Package-to-version dependency mapping.
+
+        Outputs:
+            List of structured conflict dictionaries.
+
+        Behavior:
+            Computes dependency conflicts directly from registry metadata
+            without parsing human-readable error strings.
+        """
+        if not self._is_valid_state(dependencies):
+            return []
+
+        conflicts: List[Dict[str, str]] = []
+        for package_name, package_version in sorted(dependencies.items()):
+            package_registry = self.registry.get(package_name)
+            if package_registry is None:
+                continue
+
+            package_metadata = package_registry.get(package_version)
+            if not isinstance(package_metadata, dict):
+                continue
+
+            required_dependencies = package_metadata.get("requires", {})
+            if not isinstance(required_dependencies, dict):
+                continue
+
+            for required_package, required_version in sorted(required_dependencies.items()):
+                current_version = dependencies.get(required_package)
+                if current_version is None or not self.is_compatible(
+                    required_version, current_version
+                ):
+                    conflicts.append(
+                        {
+                            "package": f"{package_name}@{package_version}",
+                            "requires": f"{required_package}@{required_version}",
+                            "found": (
+                                "<missing>"
+                                if current_version is None
+                                else f"{required_package}@{current_version}"
+                            ),
+                        }
+                    )
+
+        return conflicts
+
     def _compute_transition_reward(
         self,
         old_error_count: int,
@@ -1257,7 +1495,8 @@ class NPMResolverEnv:
 
         Behavior:
             Applies a fixed step cost, rewards genuine progress, penalizes
-            regressions and no-op loops, and adds terminal bonuses or penalties.
+            regressions and no-op loops, penalizes unnecessary deletions, and
+            adds terminal bonuses or penalties.
         """
         reward = self.step_penalty
         error_delta = old_error_count - new_error_count
@@ -1273,9 +1512,15 @@ class NPMResolverEnv:
 
         if deletion_performed:
             reward += self.deletion_penalty
+            if error_delta <= 0 and not success:
+                reward += self.unnecessary_deletion_penalty
 
         if success:
             reward += self.success_reward
+            reward += (
+                max(0, self.max_steps - self.step_count)
+                * self.minimal_step_bonus_per_remaining_step
+            )
         elif timeout_reached:
             reward += self.timeout_penalty
             reward = min(reward, self.timeout_reward_cap)
@@ -1422,23 +1667,17 @@ class NPMResolverEnv:
                 )
                 continue
 
-            required_dependencies = package_metadata.get("requires", {})
-            for required_package, required_version in required_dependencies.items():
-                current_version = dependencies.get(required_package)
-
-                if current_version is None:
-                    errors.append(
-                        f"Missing peer dependency: {package_name}@{package_version} "
-                        f"requires {required_package}@{required_version}"
-                    )
-                    continue
-
-                if not self.is_compatible(required_version, current_version):
-                    errors.append(
-                        f"Conflict: {package_name}@{package_version} requires "
-                        f"{required_package}@{required_version}, but found "
-                        f"{current_version}"
-                    )
+        for conflict in self._extract_conflicts(dependencies):
+            if conflict["found"] == "<missing>":
+                errors.append(
+                    f"Missing peer dependency: {conflict['package']} requires "
+                    f"{conflict['requires']}"
+                )
+            else:
+                errors.append(
+                    f"Conflict: {conflict['package']} requires "
+                    f"{conflict['requires']}, but found {conflict['found']}"
+                )
 
         if errors:
             return "\n".join(errors)
@@ -1476,6 +1715,20 @@ class NPMResolverEnv:
             returns a new state or a standardized transition error without
             partially mutating the source state.
         """
+        if not self._is_valid_state(state):
+            return None, self._format_error("FATAL", "Invalid dependency state.")
+
+        validation_error = self._validate_action_instance(action)
+        if validation_error is not None:
+            return None, validation_error
+
+        if not self._is_valid_version_format(action.new_version):
+            return None, self._format_error("Error", "Invalid version format.")
+
+        version_error = self._validate_registry_version(action)
+        if version_error is not None:
+            return None, version_error
+
         next_state = dict(state)
 
         if action.package_to_update not in next_state:
@@ -1508,54 +1761,112 @@ class NPMResolverEnv:
         Behavior:
             Produces a safe, framework-friendly payload suitable for checkpointing.
         """
-        return {
-            "current_state": dict(self._get_observable_state()),
-            "step_count": self.step_count,
-            "max_steps": self.max_steps,
-            "last_action": None if self.last_action is None else self.last_action.to_dict(),
-            "last_error_count": self.last_error_count,
-            "last_error_log": self.last_error_log,
-            "episode_done": self.episode_done,
-            "episode_status": self.episode_status,
-            "current_scenario_index": self.current_scenario_index,
-            "current_episode_reward": self.current_episode_reward,
-            "debug": self.debug,
-            "debug_logs": list(self.debug_logs),
-            "demo_mode": self.demo_mode,
-            "demo_trace": list(self.demo_trace),
-            "current_level": self.current_level,
-            "active_level": self.active_level,
-            "demo_scenario": dict(self.demo_scenario),
-            "level_descriptions": dict(self.level_descriptions),
-            "levels": {
-                level_name: [dict(scenario) for scenario in level_scenarios]
-                for level_name, level_scenarios in self.levels.items()
-            },
-            "registry": self._normalize_registry(self.registry),
-            "level_indices": dict(self.level_indices),
-            "success_count": self.success_count,
-            "level_success_streak": self.level_success_streak,
-            "level_success_threshold": self.level_success_threshold,
-            "total_steps": self.total_steps,
-            "episode_count": self.episode_count,
-            "total_reward": self.total_reward,
-            "history": list(self.history),
-            "reward_history": list(self.reward_history),
-            "episode_reward_history": list(self.episode_reward_history),
-            "episode_step_history": list(self.episode_step_history),
-            "episode_status_history": list(self.episode_status_history),
-            "step_penalty": self.step_penalty,
-            "progress_reward_per_error": self.progress_reward_per_error,
-            "regression_penalty_per_error": self.regression_penalty_per_error,
-            "stalled_progress_penalty": self.stalled_progress_penalty,
-            "no_op_penalty": self.no_op_penalty,
-            "invalid_action_penalty": self.invalid_action_penalty,
-            "deletion_penalty": self.deletion_penalty,
-            "timeout_penalty": self.timeout_penalty,
-            "timeout_reward_cap": self.timeout_reward_cap,
-            "success_reward": self.success_reward,
-            "fatal_penalty": self.fatal_penalty,
-        }
+        try:
+            return {
+                "current_state": dict(self._get_observable_state()),
+                "step_count": self.step_count,
+                "max_steps": self.max_steps,
+                "last_action": (
+                    None if self.last_action is None else self.last_action.to_dict()
+                ),
+                "last_error_count": self.last_error_count,
+                "last_error_log": self.last_error_log,
+                "episode_done": self.episode_done,
+                "episode_status": self.episode_status,
+                "current_scenario_index": self.current_scenario_index,
+                "current_episode_reward": self.current_episode_reward,
+                "debug": self.debug,
+                "debug_logs": list(self.debug_logs),
+                "demo_mode": self.demo_mode,
+                "demo_trace": list(self.demo_trace),
+                "current_level": self.current_level,
+                "active_level": self.active_level,
+                "demo_scenario": dict(self.demo_scenario),
+                "level_descriptions": dict(self.level_descriptions),
+                "levels": {
+                    level_name: [dict(scenario) for scenario in level_scenarios]
+                    for level_name, level_scenarios in self.levels.items()
+                },
+                "registry": self._normalize_registry(self.registry),
+                "level_indices": dict(self.level_indices),
+                "success_count": self.success_count,
+                "level_success_streak": self.level_success_streak,
+                "level_success_threshold": self.level_success_threshold,
+                "total_steps": self.total_steps,
+                "episode_count": self.episode_count,
+                "total_reward": self.total_reward,
+                "history": list(self.history),
+                "reward_history": list(self.reward_history),
+                "episode_reward_history": list(self.episode_reward_history),
+                "episode_step_history": list(self.episode_step_history),
+                "episode_status_history": list(self.episode_status_history),
+                "step_penalty": self.step_penalty,
+                "progress_reward_per_error": self.progress_reward_per_error,
+                "regression_penalty_per_error": self.regression_penalty_per_error,
+                "stalled_progress_penalty": self.stalled_progress_penalty,
+                "no_op_penalty": self.no_op_penalty,
+                "invalid_action_penalty": self.invalid_action_penalty,
+                "deletion_penalty": self.deletion_penalty,
+                "unnecessary_deletion_penalty": self.unnecessary_deletion_penalty,
+                "timeout_penalty": self.timeout_penalty,
+                "timeout_reward_cap": self.timeout_reward_cap,
+                "success_reward": self.success_reward,
+                "minimal_step_bonus_per_remaining_step": (
+                    self.minimal_step_bonus_per_remaining_step
+                ),
+                "fatal_penalty": self.fatal_penalty,
+            }
+        except Exception as exc:
+            self._log_debug(f"to_dict exception: {exc!r}")
+            return {
+                "current_state": {},
+                "step_count": 0,
+                "max_steps": max(1, int(getattr(self, "max_steps", 10))),
+                "last_action": None,
+                "last_error_count": 0,
+                "last_error_log": self._format_error(
+                    "FATAL", "Serialization failed; safe fallback emitted."
+                ),
+                "episode_done": False,
+                "episode_status": "failed",
+                "current_scenario_index": 0,
+                "current_episode_reward": 0,
+                "debug": bool(getattr(self, "debug", True)),
+                "debug_logs": list(getattr(self, "debug_logs", [])),
+                "demo_mode": bool(getattr(self, "demo_mode", True)),
+                "demo_trace": [],
+                "current_level": "level_1",
+                "active_level": "level_1",
+                "demo_scenario": {},
+                "level_descriptions": {},
+                "levels": {},
+                "registry": {},
+                "level_indices": {},
+                "success_count": 0,
+                "level_success_streak": 0,
+                "level_success_threshold": 1,
+                "total_steps": 0,
+                "episode_count": 0,
+                "total_reward": 0,
+                "history": [],
+                "reward_history": [],
+                "episode_reward_history": [],
+                "episode_step_history": [],
+                "episode_status_history": [],
+                "step_penalty": -1,
+                "progress_reward_per_error": 8,
+                "regression_penalty_per_error": 10,
+                "stalled_progress_penalty": 0,
+                "no_op_penalty": -2,
+                "invalid_action_penalty": -5,
+                "deletion_penalty": -6,
+                "unnecessary_deletion_penalty": -4,
+                "timeout_penalty": -10,
+                "timeout_reward_cap": -1,
+                "success_reward": 60,
+                "minimal_step_bonus_per_remaining_step": 1,
+                "fatal_penalty": -100,
+            }
 
     def from_dict(self, state_dict: Dict[str, Any]) -> Observation:
         """Safely restore environment state from a serialized dictionary.
@@ -1635,6 +1946,12 @@ class NPMResolverEnv:
             self.deletion_penalty = int(
                 state_dict.get("deletion_penalty", self.deletion_penalty)
             )
+            self.unnecessary_deletion_penalty = int(
+                state_dict.get(
+                    "unnecessary_deletion_penalty",
+                    self.unnecessary_deletion_penalty,
+                )
+            )
             self.timeout_penalty = int(
                 state_dict.get("timeout_penalty", self.timeout_penalty)
             )
@@ -1643,6 +1960,12 @@ class NPMResolverEnv:
             )
             self.success_reward = int(
                 state_dict.get("success_reward", self.success_reward)
+            )
+            self.minimal_step_bonus_per_remaining_step = int(
+                state_dict.get(
+                    "minimal_step_bonus_per_remaining_step",
+                    self.minimal_step_bonus_per_remaining_step,
+                )
             )
             self.fatal_penalty = int(
                 state_dict.get("fatal_penalty", self.fatal_penalty)
