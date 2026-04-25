@@ -1,4 +1,6 @@
 name: "auto-resolve-npm"
 version: "1.0.0"
 description: "An RL environment for resolving Node.js peerDependency conflicts."
-entrypoint: "environment:NPMResolverEnv"
+
+environment:
+  entrypoint: "environment:NPMResolverEnv"
