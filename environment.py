@@ -1,4 +1,18 @@
-"""OpenEnv-compatible reinforcement learning environment for npm resolution."""
+"""Production-grade RL environment for simplified npm dependency resolution.
+
+This module defines a deterministic Markov Decision Process for dependency
+repair. The MDP is intentionally simplified so agents can focus on
+decision-making rather than npm implementation details.
+
+MDP definition:
+- State: a JSON-serializable dependency map plus a deterministic audit log.
+- Action: update one package version or delete one non-core package.
+- Transition: apply exactly one validated dependency edit atomically.
+- Reward: step cost plus shaped progress, regression, deletion, success, and
+  timeout signals.
+- Termination: success, timeout, fatal anti-cheat violation, or internal
+  fail-safe recovery.
+"""
 
 from dataclasses import dataclass
 import json
@@ -181,6 +195,7 @@ class NPMResolverEnv:
         self.stalled_progress_penalty = 0
         self.no_op_penalty = -2
         self.invalid_action_penalty = -5
+        self.deletion_penalty = -6
         self.timeout_penalty = -10
         self.timeout_reward_cap = -1
         self.success_reward = 60
@@ -432,8 +447,10 @@ class NPMResolverEnv:
 
             normalized_scenarios: List[Dict[str, str]] = []
             for scenario in scenarios:
-                if not isinstance(scenario, dict) or not scenario:
-                    raise ValueError("Each scenario must be a non-empty dictionary.")
+                if not self._is_well_formed_state(
+                    scenario, require_allowed_packages=False
+                ):
+                    raise ValueError("Each scenario must be a valid non-empty dictionary.")
                 normalized_scenario = {
                     str(package_name): str(package_version)
                     for package_name, package_version in scenario.items()
@@ -479,6 +496,38 @@ class NPMResolverEnv:
         allowed_packages = getattr(self, "allowed_packages", [])
         return package_name in allowed_packages
 
+    def _is_well_formed_state(
+        self, state: object, require_allowed_packages: bool = True
+    ) -> bool:
+        """Validate the structural integrity of a dependency mapping.
+
+        Inputs:
+            state: Candidate state object.
+            require_allowed_packages: Whether package names must already be known
+                to the environment.
+
+        Outputs:
+            Boolean validity flag.
+
+        Behavior:
+            Validates dictionary shape, string keys and values, and optionally
+            restricts package names to the environment package universe.
+        """
+        if not isinstance(state, dict) or not state:
+            return False
+
+        for package_name, package_version in state.items():
+            if not isinstance(package_name, str) or package_name.strip() == "":
+                return False
+            if not isinstance(package_version, str) or package_version.strip() == "":
+                return False
+            if require_allowed_packages and not self._is_allowed_package_name(
+                package_name
+            ):
+                return False
+
+        return True
+
     def _is_valid_state(self, state: object) -> bool:
         """Validate that a dependency state is a non-empty string dictionary.
 
@@ -491,17 +540,7 @@ class NPMResolverEnv:
         Behavior:
             Rejects malformed states before they can corrupt transitions.
         """
-        if not isinstance(state, dict) or not state:
-            return False
-
-        return all(
-            isinstance(package_name, str)
-            and isinstance(package_version, str)
-            and package_name.strip() != ""
-            and self._is_allowed_package_name(package_name)
-            and package_version.strip() != ""
-            for package_name, package_version in state.items()
-        )
+        return self._is_well_formed_state(state, require_allowed_packages=True)
 
     def _safe_json_dumps(self, payload: object) -> str:
         """Serialize a payload into stable JSON without raising outward errors.
@@ -803,10 +842,28 @@ class NPMResolverEnv:
             Dictionary describing packages, curriculum, and reward configuration.
 
         Behavior:
-            Provides a judge-friendly high-level overview without requiring code
-            inspection.
+            Explains that this is a simplified npm simulation focused on
+            decision-making while also surfacing judge-friendly environment
+            metadata.
         """
         return {
+            "name": "NPMResolverEnv",
+            "summary": (
+                "Simplified npm dependency-resolution environment for reinforcement "
+                "learning and policy evaluation."
+            ),
+            "focus": (
+                "The environment emphasizes sequential decision-making, "
+                "dependency reasoning, and measurable repair progress."
+            ),
+            "compatibility_rule": (
+                "Peer dependencies are considered compatible when they match "
+                "exactly or share the same major version."
+            ),
+            "deletion_policy": (
+                "Core packages cannot be deleted. Non-core packages can be "
+                "removed with an explicit reward penalty."
+            ),
             "package_count": len(self.allowed_packages),
             "registry_package_count": len(self.registry),
             "levels": self.get_curriculum_overview(),
@@ -816,11 +873,44 @@ class NPMResolverEnv:
                 "regression_penalty_per_error": self.regression_penalty_per_error,
                 "no_op_penalty": self.no_op_penalty,
                 "invalid_action_penalty": self.invalid_action_penalty,
+                "deletion_penalty": self.deletion_penalty,
                 "timeout_penalty": self.timeout_penalty,
                 "timeout_reward_cap": self.timeout_reward_cap,
                 "success_reward": self.success_reward,
                 "fatal_penalty": self.fatal_penalty,
             },
+        }
+
+    def get_env_info(self) -> Dict[str, Any]:
+        """Return a compact interface-level description of the environment.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Dictionary describing the state space, action space, reward structure,
+            and episode horizon.
+
+        Behavior:
+            Exposes a clean summary suitable for agents, demos, and hackathon
+            reviewers.
+        """
+        return {
+            "name": "NPMResolverEnv",
+            "state_space": (
+                "JSON dependency map plus deterministic npm-style conflict log "
+                "and step counter."
+            ),
+            "action_space": (
+                "Action(package_to_update: str, new_version: semver string or "
+                "\"DELETE\" for non-core packages)."
+            ),
+            "reward_structure": (
+                "Fixed step cost, per-error progress reward, per-error regression "
+                "penalty, no-op penalty, deletion penalty, success bonus, and "
+                "timeout penalty."
+            ),
+            "max_steps": self.max_steps,
         }
 
     def render_demo_trace(self) -> str:
@@ -884,14 +974,33 @@ class NPMResolverEnv:
             "status": self.episode_status,
             "resolved": self.last_error_count == 0,
             "remaining_errors": self.last_error_count,
+            "steps": self.step_count,
             "step_count": self.step_count,
             "episode_reward": self.current_episode_reward,
+            "total_reward": self.total_reward,
             "level": self.active_level,
             "scenario_index": self.current_scenario_index,
             "state": dict(self._get_observable_state()),
             "state_json": self._safe_json_dumps(self._get_observable_state()),
             "error_log": self.last_error_log,
         }
+
+    def print_metrics_summary(self) -> str:
+        """Render and print the current aggregate metrics summary.
+
+        Inputs:
+            None.
+
+        Outputs:
+            JSON-formatted metrics summary string.
+
+        Behavior:
+            Produces a readable evaluation snapshot and prints it for demos or
+            scripts while also returning the same text.
+        """
+        metrics_summary = self._safe_json_dumps(self.get_metrics())
+        print(metrics_summary)
+        return metrics_summary
 
     def _finalize_transition(
         self,
@@ -1072,11 +1181,64 @@ class NPMResolverEnv:
 
         return None
 
+    def _extract_major_version(self, version: str) -> Optional[int]:
+        """Extract the major version number from a lightweight semver string.
+
+        Inputs:
+            version: Version string such as `^18.0.0` or `6.0.0`.
+
+        Outputs:
+            Major version integer when parseable, otherwise `None`.
+
+        Behavior:
+            Supports the simplified version language used by this environment.
+        """
+        cleaned_version = version.strip()
+        if cleaned_version.startswith("^"):
+            cleaned_version = cleaned_version[1:]
+
+        parts = cleaned_version.split(".")
+        if not parts:
+            return None
+
+        try:
+            return int(parts[0])
+        except ValueError:
+            return None
+
+    def is_compatible(self, required: str, actual: str) -> bool:
+        """Evaluate lightweight npm-style compatibility between two versions.
+
+        Inputs:
+            required: Required version string from registry metadata.
+            actual: Actual version string present in the environment state.
+
+        Outputs:
+            Boolean compatibility flag.
+
+        Behavior:
+            Treats exact matches as compatible and otherwise falls back to a
+            simplified same-major-version rule.
+        """
+        if required == actual:
+            return True
+
+        if required == "DELETE" or actual == "DELETE":
+            return False
+
+        required_major = self._extract_major_version(required)
+        actual_major = self._extract_major_version(actual)
+        if required_major is None or actual_major is None:
+            return False
+
+        return required_major == actual_major
+
     def _compute_transition_reward(
         self,
         old_error_count: int,
         new_error_count: int,
         state_changed: bool,
+        deletion_performed: bool,
         success: bool,
         timeout_reached: bool,
     ) -> int:
@@ -1086,6 +1248,7 @@ class NPMResolverEnv:
             old_error_count: Error count before applying the action.
             new_error_count: Error count after applying the action.
             state_changed: Whether the action produced a new dependency state.
+            deletion_performed: Whether the transition deleted a non-core package.
             success: Whether the transition resolved the environment.
             timeout_reached: Whether the episode exhausted its step budget.
 
@@ -1107,6 +1270,9 @@ class NPMResolverEnv:
             reward -= abs(error_delta) * self.regression_penalty_per_error
         else:
             reward += self.stalled_progress_penalty
+
+        if deletion_performed:
+            reward += self.deletion_penalty
 
         if success:
             reward += self.success_reward
@@ -1231,7 +1397,7 @@ class NPMResolverEnv:
 
         Behavior:
             Detects invalid state, empty state, unknown metadata, missing peer
-            dependencies, and exact-string version conflicts.
+            dependencies, and simplified major-version compatibility conflicts.
         """
         if not self._is_valid_state(dependencies):
             return self._format_error("FATAL", "Invalid dependency state.")
@@ -1267,7 +1433,7 @@ class NPMResolverEnv:
                     )
                     continue
 
-                if current_version != required_version:
+                if not self.is_compatible(required_version, current_version):
                     errors.append(
                         f"Conflict: {package_name}@{package_version} requires "
                         f"{required_package}@{required_version}, but found "
@@ -1306,8 +1472,9 @@ class NPMResolverEnv:
             Tuple of `(next_state, error_message)`.
 
         Behavior:
-            Applies anti-cheat rules and returns a new state or a standardized
-            transition error without partially mutating the source state.
+            Applies anti-cheat rules, allows controlled non-core deletion, and
+            returns a new state or a standardized transition error without
+            partially mutating the source state.
         """
         next_state = dict(state)
 
@@ -1320,9 +1487,7 @@ class NPMResolverEnv:
                     "FATAL", "Cannot remove core framework."
                 )
 
-            return None, self._format_error(
-                "FATAL", "Dependency deletion is not allowed during resolution."
-            )
+            del next_state[action.package_to_update]
         else:
             next_state[action.package_to_update] = action.new_version
 
@@ -1360,6 +1525,7 @@ class NPMResolverEnv:
             "demo_trace": list(self.demo_trace),
             "current_level": self.current_level,
             "active_level": self.active_level,
+            "demo_scenario": dict(self.demo_scenario),
             "level_descriptions": dict(self.level_descriptions),
             "levels": {
                 level_name: [dict(scenario) for scenario in level_scenarios]
@@ -1378,6 +1544,17 @@ class NPMResolverEnv:
             "episode_reward_history": list(self.episode_reward_history),
             "episode_step_history": list(self.episode_step_history),
             "episode_status_history": list(self.episode_status_history),
+            "step_penalty": self.step_penalty,
+            "progress_reward_per_error": self.progress_reward_per_error,
+            "regression_penalty_per_error": self.regression_penalty_per_error,
+            "stalled_progress_penalty": self.stalled_progress_penalty,
+            "no_op_penalty": self.no_op_penalty,
+            "invalid_action_penalty": self.invalid_action_penalty,
+            "deletion_penalty": self.deletion_penalty,
+            "timeout_penalty": self.timeout_penalty,
+            "timeout_reward_cap": self.timeout_reward_cap,
+            "success_reward": self.success_reward,
+            "fatal_penalty": self.fatal_penalty,
         }
 
     def from_dict(self, state_dict: Dict[str, Any]) -> Observation:
@@ -1410,6 +1587,15 @@ class NPMResolverEnv:
             if raw_levels is not None:
                 self.levels = self._normalize_levels(raw_levels)
 
+            raw_demo_scenario = state_dict.get("demo_scenario")
+            if raw_demo_scenario is not None and self._is_well_formed_state(
+                raw_demo_scenario, require_allowed_packages=False
+            ):
+                self.demo_scenario = {
+                    str(package_name): str(package_version)
+                    for package_name, package_version in raw_demo_scenario.items()
+                }
+
             raw_level_descriptions = state_dict.get("level_descriptions", {})
             if isinstance(raw_level_descriptions, dict):
                 self.level_descriptions = {
@@ -1421,6 +1607,46 @@ class NPMResolverEnv:
 
             self.step_count = max(0, int(state_dict.get("step_count", 0)))
             self.max_steps = max(1, int(state_dict.get("max_steps", self.max_steps)))
+            self.step_penalty = int(state_dict.get("step_penalty", self.step_penalty))
+            self.progress_reward_per_error = int(
+                state_dict.get(
+                    "progress_reward_per_error", self.progress_reward_per_error
+                )
+            )
+            self.regression_penalty_per_error = int(
+                state_dict.get(
+                    "regression_penalty_per_error",
+                    self.regression_penalty_per_error,
+                )
+            )
+            self.stalled_progress_penalty = int(
+                state_dict.get(
+                    "stalled_progress_penalty", self.stalled_progress_penalty
+                )
+            )
+            self.no_op_penalty = int(
+                state_dict.get("no_op_penalty", self.no_op_penalty)
+            )
+            self.invalid_action_penalty = int(
+                state_dict.get(
+                    "invalid_action_penalty", self.invalid_action_penalty
+                )
+            )
+            self.deletion_penalty = int(
+                state_dict.get("deletion_penalty", self.deletion_penalty)
+            )
+            self.timeout_penalty = int(
+                state_dict.get("timeout_penalty", self.timeout_penalty)
+            )
+            self.timeout_reward_cap = int(
+                state_dict.get("timeout_reward_cap", self.timeout_reward_cap)
+            )
+            self.success_reward = int(
+                state_dict.get("success_reward", self.success_reward)
+            )
+            self.fatal_penalty = int(
+                state_dict.get("fatal_penalty", self.fatal_penalty)
+            )
             self.debug = bool(state_dict.get("debug", self.debug))
             raw_logs = state_dict.get("debug_logs", [])
             self.debug_logs = (
@@ -1728,6 +1954,7 @@ class NPMResolverEnv:
             error_log = self._safe_current_error_log()
             new_error_count = self._count_errors(error_log)
             state_changed = next_state != state_snapshot
+            deletion_performed = self.last_action.new_version == "DELETE"
 
             done = False
             status = "in_progress"
@@ -1737,6 +1964,7 @@ class NPMResolverEnv:
                 old_error_count=old_error_count,
                 new_error_count=new_error_count,
                 state_changed=state_changed,
+                deletion_performed=deletion_performed,
                 success=success,
                 timeout_reached=timeout_reached and not success,
             )
@@ -1859,7 +2087,7 @@ class NPMResolverEnv:
             self.level_descriptions.setdefault(
                 validated_level, "Custom curriculum level."
             )
-        if not self._is_valid_state(scenario):
+        if not self._is_well_formed_state(scenario, require_allowed_packages=False):
             raise ValueError("scenario must be a valid non-empty package map.")
 
         self.levels[validated_level].append(dict(scenario))
@@ -1925,9 +2153,9 @@ def _run_interface_validation() -> None:
     _, delete_reward, delete_done, delete_info = delete_env.step(
         Action(package_to_update="react-router-dom", new_version="DELETE")
     )
-    assert delete_reward == delete_env.fatal_penalty
+    assert delete_reward > 0
     assert delete_done
-    assert delete_info["status"] == "failed"
+    assert delete_info["status"] == "success"
 
     regression_env = NPMResolverEnv()
     regression_env.current_level = "level_3"
@@ -1954,9 +2182,25 @@ def _run_interface_validation() -> None:
     assert timeout_done
     assert timeout_info["status"] == "timeout"
 
+    compatibility_env = NPMResolverEnv()
+    assert compatibility_env.is_compatible("^18.0.0", "^18.2.0")
+    assert compatibility_env.is_compatible("^18.0.0", "18.1.0")
+    assert not compatibility_env.is_compatible("^18.0.0", "^17.9.0")
+
 
 def _run_metrics_validation() -> None:
-    """Run a small multi-episode simulation and print metrics for evaluation."""
+    """Run a small multi-episode simulation and print metrics for evaluation.
+
+    Inputs:
+        None.
+
+    Outputs:
+        None.
+
+    Behavior:
+        Exercises success, progression, and timeout paths before printing a
+        compact metrics snapshot for manual verification.
+    """
     env = NPMResolverEnv()
     env.current_level = "level_1"
 
@@ -1990,7 +2234,18 @@ def _run_metrics_validation() -> None:
 
 
 def _run_demo_validation() -> None:
-    """Run a simple fixed demo episode and print the structured trace."""
+    """Run a simple fixed demo episode and print the structured trace.
+
+    Inputs:
+        None.
+
+    Outputs:
+        None.
+
+    Behavior:
+        Executes a deterministic demo agent, then prints the environment
+        description, readable demo trace, and final state summary.
+    """
 
     def demo_agent(observation: Observation) -> Action:
         state = json.loads(observation.current_package_json)
