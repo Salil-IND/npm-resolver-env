@@ -14,7 +14,9 @@ MDP definition:
   fail-safe recovery.
 """
 
+import copy
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -207,7 +209,15 @@ class NPMResolverEnv:
         self.timeout_reward_cap = -1
         self.success_reward = 50
         self.minimal_step_bonus_per_remaining_step = 1
+        self.minimum_package_count = 2
+        self.repeat_state_penalty = -8
+        self.cycle_termination_threshold = 3
         self.fatal_penalty = -100
+        self.cycle_message = "CYCLE: Repeated state detected."
+        self.visited_state_counts: Dict[str, int] = {}
+        self.last_state_hash = ""
+        self._action_mask_cache_key = ""
+        self._action_mask_cache_value: Dict[str, List[str]] = {}
         self.registry = {
             "react-dom": {
                 "^17.0.0": {"requires": {"react": "^17.0.0"}},
@@ -293,6 +303,10 @@ class NPMResolverEnv:
             "react-router-dom": "6.0.0",
         }
         self._refresh_cached_metadata()
+        self.current_state = self._get_safe_fallback_state()
+        self._initialize_state_tracking(self.current_state)
+        self.last_error_log = self._safe_current_error_log()
+        self.last_error_count = self._count_errors(self.last_error_log)
 
     def _log_debug(self, message: str) -> None:
         """Record a bounded internal debug message when debug mode is enabled.
@@ -345,6 +359,12 @@ class NPMResolverEnv:
             return 0
 
         if error_log.startswith(self.timeout_message):
+            _, _, remainder = error_log.partition("\n")
+            if not remainder:
+                return 0
+            return self._count_errors(remainder)
+
+        if error_log.startswith(self.cycle_message):
             _, _, remainder = error_log.partition("\n")
             if not remainder:
                 return 0
@@ -528,6 +548,270 @@ class NPMResolverEnv:
             level_name: max(0, int(current_indices.get(level_name, 0)))
             for level_name in self.levels
         }
+        self._invalidate_action_mask_cache()
+
+    def _invalidate_action_mask_cache(self) -> None:
+        """Clear cached action-mask data after any relevant state change.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Drops cached action-mask computations so future queries are always
+            consistent with the latest state and registry metadata.
+        """
+        self._action_mask_cache_key = ""
+        self._action_mask_cache_value = {}
+
+    def _has_known_version(self, package_name: str, package_version: str) -> bool:
+        """Check whether a package version is part of the known environment space.
+
+        Inputs:
+            package_name: Package name to validate.
+            package_version: Version string to validate.
+
+        Outputs:
+            Boolean validity flag.
+
+        Behavior:
+            Accepts versions known from the registry or the cached version
+            catalog while always rejecting `DELETE` as a persisted state value.
+        """
+        if package_version == "DELETE":
+            return False
+
+        package_registry = getattr(self, "registry", {}).get(package_name)
+        if isinstance(package_registry, dict) and package_version in package_registry:
+            return True
+
+        version_catalog = getattr(self, "package_version_catalog", {})
+        known_versions = version_catalog.get(package_name, [])
+        return package_version in known_versions
+
+    def _get_safe_fallback_state(self) -> Dict[str, str]:
+        """Return a deterministic valid fallback state for fail-safe recovery.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Valid dependency state dictionary.
+
+        Behavior:
+            Prefers the first valid curriculum scenario and falls back to a
+            minimal built-in React pair if the curriculum is unavailable.
+        """
+        candidate_levels = []
+        if isinstance(getattr(self, "current_level", None), str):
+            candidate_levels.append(self.current_level)
+        candidate_levels.extend(level for level in sorted(self.levels) if level not in candidate_levels)
+
+        for level_name in candidate_levels:
+            for scenario in self.levels.get(level_name, []):
+                if self._is_valid_state(scenario):
+                    return dict(sorted(scenario.items()))
+
+        if self._is_valid_state(self.demo_scenario):
+            return dict(sorted(self.demo_scenario.items()))
+
+        return {
+            "react": "^17.0.0",
+            "react-dom": "^17.0.0",
+        }
+
+    def _state_hash(self, state: Dict[str, str]) -> str:
+        """Compute a deterministic hash for a dependency state.
+
+        Inputs:
+            state: Valid dependency state.
+
+        Outputs:
+            Stable hexadecimal hash string.
+
+        Behavior:
+            Uses canonical sorted JSON serialization so equal states always
+            produce equal hashes.
+        """
+        canonical_json = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def _initialize_state_tracking(
+        self,
+        state: Dict[str, str],
+        visited_state_counts: Optional[Dict[str, int]] = None,
+        last_state_hash: Optional[str] = None,
+    ) -> None:
+        """Initialize deterministic state-visit tracking for an episode.
+
+        Inputs:
+            state: Current valid environment state.
+            visited_state_counts: Optional precomputed visitation counts.
+            last_state_hash: Optional last-state hash from serialized state.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Sanitizes or reconstructs visitation data while ensuring the current
+            state always has at least one recorded visit.
+        """
+        current_hash = self._state_hash(state)
+        sanitized_counts: Dict[str, int] = {}
+
+        if isinstance(visited_state_counts, dict):
+            for state_hash, visit_count in sorted(visited_state_counts.items()):
+                if isinstance(state_hash, str) and isinstance(visit_count, int) and visit_count > 0:
+                    sanitized_counts[state_hash] = visit_count
+
+        if current_hash not in sanitized_counts:
+            sanitized_counts[current_hash] = 1
+
+        self.visited_state_counts = sanitized_counts
+        if isinstance(last_state_hash, str) and last_state_hash in sanitized_counts:
+            self.last_state_hash = last_state_hash
+        else:
+            self.last_state_hash = current_hash
+        self._invalidate_action_mask_cache()
+
+    def _record_state_visit(self, state: Dict[str, str]) -> Tuple[str, int]:
+        """Record a visit to a valid dependency state.
+
+        Inputs:
+            state: Valid dependency state.
+
+        Outputs:
+            Tuple of `(state_hash, visit_count_after_recording)`.
+
+        Behavior:
+            Updates deterministic visitation counts used for cycle detection and
+            repeated-state penalties.
+        """
+        state_hash = self._state_hash(state)
+        visit_count = self.visited_state_counts.get(state_hash, 0) + 1
+        self.visited_state_counts[state_hash] = visit_count
+        self.last_state_hash = state_hash
+        self._invalidate_action_mask_cache()
+        return state_hash, visit_count
+
+    def _capture_runtime_snapshot(self) -> Dict[str, Any]:
+        """Capture a deep snapshot of mutable environment runtime state.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Dictionary snapshot suitable for full rollback.
+
+        Behavior:
+            Includes mutable runtime, curriculum, reward, cache, and visitation
+            data so exceptions can restore the environment exactly.
+        """
+        return copy.deepcopy(
+            {
+                "current_state": self.current_state,
+                "step_count": self.step_count,
+                "max_steps": self.max_steps,
+                "last_action": self.last_action,
+                "last_error_count": self.last_error_count,
+                "last_error_log": self.last_error_log,
+                "episode_done": self.episode_done,
+                "episode_status": self.episode_status,
+                "current_scenario_index": self.current_scenario_index,
+                "current_episode_reward": self.current_episode_reward,
+                "_episode_metrics_committed": self._episode_metrics_committed,
+                "debug": self.debug,
+                "debug_logs": self.debug_logs,
+                "demo_mode": self.demo_mode,
+                "demo_trace": self.demo_trace,
+                "current_level": self.current_level,
+                "active_level": self.active_level,
+                "demo_scenario": self.demo_scenario,
+                "level_descriptions": self.level_descriptions,
+                "levels": self.levels,
+                "registry": self.registry,
+                "allowed_packages": getattr(self, "allowed_packages", []),
+                "package_version_catalog": getattr(
+                    self, "package_version_catalog", {}
+                ),
+                "level_indices": self.level_indices,
+                "success_count": self.success_count,
+                "level_success_streak": self.level_success_streak,
+                "level_success_threshold": self.level_success_threshold,
+                "total_steps": self.total_steps,
+                "episode_count": self.episode_count,
+                "total_reward": self.total_reward,
+                "history": self.history,
+                "reward_history": self.reward_history,
+                "episode_reward_history": self.episode_reward_history,
+                "episode_step_history": self.episode_step_history,
+                "episode_status_history": self.episode_status_history,
+                "step_penalty": self.step_penalty,
+                "progress_reward_per_error": self.progress_reward_per_error,
+                "regression_penalty_per_error": self.regression_penalty_per_error,
+                "stalled_progress_penalty": self.stalled_progress_penalty,
+                "no_op_penalty": self.no_op_penalty,
+                "invalid_action_penalty": self.invalid_action_penalty,
+                "deletion_penalty": self.deletion_penalty,
+                "unnecessary_deletion_penalty": self.unnecessary_deletion_penalty,
+                "timeout_penalty": self.timeout_penalty,
+                "timeout_reward_cap": self.timeout_reward_cap,
+                "success_reward": self.success_reward,
+                "minimal_step_bonus_per_remaining_step": self.minimal_step_bonus_per_remaining_step,
+                "minimum_package_count": self.minimum_package_count,
+                "repeat_state_penalty": self.repeat_state_penalty,
+                "cycle_termination_threshold": self.cycle_termination_threshold,
+                "fatal_penalty": self.fatal_penalty,
+                "cycle_message": self.cycle_message,
+                "visited_state_counts": self.visited_state_counts,
+                "last_state_hash": self.last_state_hash,
+                "_action_mask_cache_key": self._action_mask_cache_key,
+                "_action_mask_cache_value": self._action_mask_cache_value,
+            }
+        )
+
+    def _restore_runtime_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """Restore a previously captured runtime snapshot.
+
+        Inputs:
+            snapshot: Snapshot returned by `_capture_runtime_snapshot()`.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Replaces mutable environment fields atomically after an exception or
+            rejected restore attempt.
+        """
+        for attribute_name, attribute_value in snapshot.items():
+            setattr(self, attribute_name, copy.deepcopy(attribute_value))
+
+    def _repair_runtime_state_if_needed(self) -> None:
+        """Repair invalid runtime state deterministically after metadata changes.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Replaces invalid runtime state with a deterministic safe fallback and
+            reinitializes visitation tracking so invariants continue to hold.
+        """
+        if self.current_state and not self._is_valid_state(self.current_state):
+            self.current_state = self._get_safe_fallback_state()
+            self._initialize_state_tracking(self.current_state)
+            self.last_error_log = self._safe_current_error_log()
+            self.last_error_count = self._count_errors(self.last_error_log)
+            self.episode_done = False
+            self.episode_status = "failed"
+            return
+
+        if self._is_valid_state(self.current_state) and not self.visited_state_counts:
+            self._initialize_state_tracking(self.current_state)
 
     def _is_allowed_package_name(self, package_name: str) -> bool:
         """Check whether a package name is part of the supported environment.
@@ -564,15 +848,41 @@ class NPMResolverEnv:
         if not isinstance(state, dict) or not state:
             return False
 
-        for package_name, package_version in state.items():
+        normalized_state: Dict[str, str] = {}
+        for package_name, package_version in sorted(state.items()):
             if not isinstance(package_name, str) or package_name.strip() == "":
                 return False
             if not isinstance(package_version, str) or package_version.strip() == "":
                 return False
+            normalized_package_name = package_name.strip()
+            normalized_package_version = package_version.strip()
+
+            if normalized_package_name in normalized_state:
+                return False
+            if normalized_package_version == "DELETE":
+                return False
+            if not self._is_valid_version_format(normalized_package_version):
+                return False
             if require_allowed_packages and not self._is_allowed_package_name(
-                package_name
+                normalized_package_name
             ):
                 return False
+            if require_allowed_packages and not self._has_known_version(
+                normalized_package_name, normalized_package_version
+            ):
+                return False
+            if (
+                not require_allowed_packages
+                and normalized_package_name in self.registry
+                and normalized_package_version
+                not in self.registry[normalized_package_name]
+            ):
+                return False
+
+            normalized_state[normalized_package_name] = normalized_package_version
+
+        if len(normalized_state) < self.minimum_package_count:
+            return False
 
         return True
 
@@ -622,7 +932,7 @@ class NPMResolverEnv:
         if self._is_valid_state(self.current_state):
             return dict(self.current_state)
 
-        return {}
+        return self._get_safe_fallback_state()
 
     def _build_observation(self, error_log: str) -> Observation:
         """Construct a stable observation from the current state and log.
@@ -940,6 +1250,8 @@ class NPMResolverEnv:
                 "minimal_step_bonus_per_remaining_step": (
                     self.minimal_step_bonus_per_remaining_step
                 ),
+                "repeat_state_penalty": self.repeat_state_penalty,
+                "cycle_termination_threshold": self.cycle_termination_threshold,
                 "fatal_penalty": self.fatal_penalty,
             },
         }
@@ -992,6 +1304,13 @@ class NPMResolverEnv:
         if self.episode_done or not self._is_valid_state(self.current_state):
             return {}
 
+        current_state_hash = self._state_hash(self.current_state)
+        if self._action_mask_cache_key == current_state_hash:
+            return {
+                package_name: list(candidate_versions)
+                for package_name, candidate_versions in self._action_mask_cache_value.items()
+            }
+
         action_mask: Dict[str, List[str]] = {}
         for package_name in sorted(self.current_state):
             current_version = self.current_state[package_name]
@@ -1020,7 +1339,15 @@ class NPMResolverEnv:
             if valid_versions:
                 action_mask[package_name] = valid_versions
 
-        return action_mask
+        self._action_mask_cache_key = current_state_hash
+        self._action_mask_cache_value = {
+            package_name: list(candidate_versions)
+            for package_name, candidate_versions in action_mask.items()
+        }
+        return {
+            package_name: list(candidate_versions)
+            for package_name, candidate_versions in action_mask.items()
+        }
 
     def get_valid_actions(self) -> List[Action]:
         """Return the current deterministic list of valid environment actions.
@@ -1218,6 +1545,7 @@ class NPMResolverEnv:
             return
 
         self.current_level = self.level_order[current_index + 1]
+        self.level_indices[self.current_level] = 0
         self.level_success_streak = 0
         self._log_debug(f"Advanced curriculum to {self.current_level}.")
 
@@ -1234,6 +1562,10 @@ class NPMResolverEnv:
             Cycles through scenarios deterministically to preserve reproducibility.
         """
         level_scenarios = self.levels[level_name]
+        if not level_scenarios:
+            fallback_level = self._validate_level("level_1")
+            level_scenarios = self.levels[fallback_level]
+            level_name = fallback_level
         index = self.level_indices.get(level_name, 0) % len(level_scenarios)
         self.level_indices[level_name] = index + 1
         return dict(level_scenarios[index]), index + 1
@@ -1277,7 +1609,8 @@ class NPMResolverEnv:
         self.demo_trace = []
         self.episode_count += 1
         self.active_level = safe_level_name
-        self.current_state = dict(safe_scenario)
+        self.current_state = dict(sorted(safe_scenario.items()))
+        self._initialize_state_tracking(self.current_state)
         self.last_error_log = self._safe_current_error_log()
         self.last_error_count = self._count_errors(self.last_error_log)
         self._log_debug(
@@ -1477,6 +1810,8 @@ class NPMResolverEnv:
         new_error_count: int,
         state_changed: bool,
         deletion_performed: bool,
+        repeated_state: bool,
+        state_visit_count: int,
         success: bool,
         timeout_reached: bool,
     ) -> int:
@@ -1515,6 +1850,9 @@ class NPMResolverEnv:
             if error_delta <= 0 and not success:
                 reward += self.unnecessary_deletion_penalty
 
+        if repeated_state:
+            reward += self.repeat_state_penalty * max(1, state_visit_count - 1)
+
         if success:
             reward += self.success_reward
             reward += (
@@ -1525,6 +1863,13 @@ class NPMResolverEnv:
             reward += self.timeout_penalty
             reward = min(reward, self.timeout_reward_cap)
 
+        max_reward = (
+            self.success_reward
+            + (self.max_steps * self.minimal_step_bonus_per_remaining_step)
+            + (max(0, old_error_count) * self.progress_reward_per_error)
+        )
+        reward = min(reward, max_reward)
+        reward = max(reward, self.fatal_penalty)
         return reward
 
     def _finalize_invalid_action(
@@ -1587,6 +1932,24 @@ class NPMResolverEnv:
             return self.timeout_message
 
         return f"{self.timeout_message}\n{current_error_log}"
+
+    def _compose_cycle_log(self, current_error_log: str) -> str:
+        """Create a deterministic cycle-detection log.
+
+        Inputs:
+            current_error_log: Audit log for the repeated current state.
+
+        Outputs:
+            Human-readable cycle log, optionally followed by current errors.
+
+        Behavior:
+            Preserves the real unresolved audit details while clearly marking
+            that the episode ended due to repeated-state detection.
+        """
+        if not current_error_log or current_error_log == self.success_message:
+            return self.cycle_message
+
+        return f"{self.cycle_message}\n{current_error_log}"
 
     def _validate_action_instance(self, action: Action) -> Optional[str]:
         """Validate a strict Action object for use in `step()`.
@@ -1652,7 +2015,7 @@ class NPMResolverEnv:
 
         errors: List[str] = []
 
-        for package_name, package_version in dependencies.items():
+        for package_name, package_version in sorted(dependencies.items()):
             package_registry = self.registry.get(package_name)
             if package_registry is None:
                 continue
@@ -1729,7 +2092,7 @@ class NPMResolverEnv:
         if version_error is not None:
             return None, version_error
 
-        next_state = dict(state)
+        next_state = dict(sorted(state.items()))
 
         if action.package_to_update not in next_state:
             return None, self._format_error("Error", "Package not found.")
@@ -1744,10 +2107,13 @@ class NPMResolverEnv:
         else:
             next_state[action.package_to_update] = action.new_version
 
-        if not self._is_valid_state(next_state) or len(next_state) < 2:
+        if (
+            not self._is_valid_state(next_state)
+            or len(next_state) < self.minimum_package_count
+        ):
             return None, self._format_error("FATAL", "Invalid dependency state.")
 
-        return next_state, None
+        return dict(sorted(next_state.items())), None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the full environment state for storage or transport.
@@ -1775,6 +2141,7 @@ class NPMResolverEnv:
                 "episode_status": self.episode_status,
                 "current_scenario_index": self.current_scenario_index,
                 "current_episode_reward": self.current_episode_reward,
+                "_episode_metrics_committed": self._episode_metrics_committed,
                 "debug": self.debug,
                 "debug_logs": list(self.debug_logs),
                 "demo_mode": self.demo_mode,
@@ -1814,58 +2181,76 @@ class NPMResolverEnv:
                 "minimal_step_bonus_per_remaining_step": (
                     self.minimal_step_bonus_per_remaining_step
                 ),
+                "minimum_package_count": self.minimum_package_count,
+                "repeat_state_penalty": self.repeat_state_penalty,
+                "cycle_termination_threshold": self.cycle_termination_threshold,
                 "fatal_penalty": self.fatal_penalty,
+                "cycle_message": self.cycle_message,
+                "visited_state_counts": dict(self.visited_state_counts),
+                "last_state_hash": self.last_state_hash,
             }
         except Exception as exc:
             self._log_debug(f"to_dict exception: {exc!r}")
+            safe_state = self._get_safe_fallback_state()
             return {
-                "current_state": {},
+                "current_state": dict(safe_state),
                 "step_count": 0,
                 "max_steps": max(1, int(getattr(self, "max_steps", 10))),
                 "last_action": None,
                 "last_error_count": 0,
-                "last_error_log": self._format_error(
-                    "FATAL", "Serialization failed; safe fallback emitted."
-                ),
+                "last_error_log": getattr(self, "last_error_log", self.success_message),
                 "episode_done": False,
-                "episode_status": "failed",
-                "current_scenario_index": 0,
-                "current_episode_reward": 0,
+                "episode_status": getattr(self, "episode_status", "in_progress"),
+                "current_scenario_index": getattr(self, "current_scenario_index", 0),
+                "current_episode_reward": getattr(self, "current_episode_reward", 0),
+                "_episode_metrics_committed": getattr(
+                    self, "_episode_metrics_committed", False
+                ),
                 "debug": bool(getattr(self, "debug", True)),
                 "debug_logs": list(getattr(self, "debug_logs", [])),
                 "demo_mode": bool(getattr(self, "demo_mode", True)),
-                "demo_trace": [],
-                "current_level": "level_1",
-                "active_level": "level_1",
-                "demo_scenario": {},
-                "level_descriptions": {},
-                "levels": {},
-                "registry": {},
-                "level_indices": {},
-                "success_count": 0,
-                "level_success_streak": 0,
-                "level_success_threshold": 1,
-                "total_steps": 0,
-                "episode_count": 0,
-                "total_reward": 0,
-                "history": [],
-                "reward_history": [],
-                "episode_reward_history": [],
-                "episode_step_history": [],
-                "episode_status_history": [],
-                "step_penalty": -1,
-                "progress_reward_per_error": 8,
-                "regression_penalty_per_error": 10,
-                "stalled_progress_penalty": 0,
-                "no_op_penalty": -2,
-                "invalid_action_penalty": -5,
-                "deletion_penalty": -6,
-                "unnecessary_deletion_penalty": -4,
-                "timeout_penalty": -10,
-                "timeout_reward_cap": -1,
-                "success_reward": 60,
-                "minimal_step_bonus_per_remaining_step": 1,
-                "fatal_penalty": -100,
+                "demo_trace": list(getattr(self, "demo_trace", [])),
+                "current_level": getattr(self, "current_level", "level_1"),
+                "active_level": getattr(self, "active_level", "level_1"),
+                "demo_scenario": dict(getattr(self, "demo_scenario", safe_state)),
+                "level_descriptions": dict(getattr(self, "level_descriptions", {})),
+                "levels": copy.deepcopy(getattr(self, "levels", {})),
+                "registry": copy.deepcopy(getattr(self, "registry", {})),
+                "level_indices": dict(getattr(self, "level_indices", {})),
+                "success_count": getattr(self, "success_count", 0),
+                "level_success_streak": getattr(self, "level_success_streak", 0),
+                "level_success_threshold": getattr(self, "level_success_threshold", 1),
+                "total_steps": getattr(self, "total_steps", 0),
+                "episode_count": getattr(self, "episode_count", 0),
+                "total_reward": getattr(self, "total_reward", 0),
+                "history": list(getattr(self, "history", [])),
+                "reward_history": list(getattr(self, "reward_history", [])),
+                "episode_reward_history": list(getattr(self, "episode_reward_history", [])),
+                "episode_step_history": list(getattr(self, "episode_step_history", [])),
+                "episode_status_history": list(getattr(self, "episode_status_history", [])),
+                "step_penalty": getattr(self, "step_penalty", -1),
+                "progress_reward_per_error": getattr(self, "progress_reward_per_error", 10),
+                "regression_penalty_per_error": getattr(self, "regression_penalty_per_error", 10),
+                "stalled_progress_penalty": getattr(self, "stalled_progress_penalty", 0),
+                "no_op_penalty": getattr(self, "no_op_penalty", -2),
+                "invalid_action_penalty": getattr(self, "invalid_action_penalty", -5),
+                "deletion_penalty": getattr(self, "deletion_penalty", -6),
+                "unnecessary_deletion_penalty": getattr(self, "unnecessary_deletion_penalty", -4),
+                "timeout_penalty": getattr(self, "timeout_penalty", -10),
+                "timeout_reward_cap": getattr(self, "timeout_reward_cap", -1),
+                "success_reward": getattr(self, "success_reward", 50),
+                "minimal_step_bonus_per_remaining_step": getattr(
+                    self, "minimal_step_bonus_per_remaining_step", 1
+                ),
+                "minimum_package_count": getattr(self, "minimum_package_count", 2),
+                "repeat_state_penalty": getattr(self, "repeat_state_penalty", -8),
+                "cycle_termination_threshold": getattr(
+                    self, "cycle_termination_threshold", 3
+                ),
+                "fatal_penalty": getattr(self, "fatal_penalty", -100),
+                "cycle_message": getattr(self, "cycle_message", "CYCLE: Repeated state detected."),
+                "visited_state_counts": dict(getattr(self, "visited_state_counts", {})),
+                "last_state_hash": getattr(self, "last_state_hash", ""),
             }
 
     def from_dict(self, state_dict: Dict[str, Any]) -> Observation:
@@ -1881,16 +2266,14 @@ class NPMResolverEnv:
             Restores valid fields, repairs invalid input with safe defaults, and
             re-audits the restored dependency state.
         """
+        snapshot = self._capture_runtime_snapshot()
         try:
             if not isinstance(state_dict, dict):
-                return self.reset()
+                raise TypeError("State payload must be a dictionary.")
 
             raw_registry = state_dict.get("registry")
             if isinstance(raw_registry, str):
-                try:
-                    raw_registry = json.loads(raw_registry)
-                except json.JSONDecodeError:
-                    raw_registry = self.registry
+                raw_registry = json.loads(raw_registry)
             if raw_registry is not None:
                 self.registry = self._normalize_registry(raw_registry)
 
@@ -1899,16 +2282,20 @@ class NPMResolverEnv:
                 self.levels = self._normalize_levels(raw_levels)
 
             raw_demo_scenario = state_dict.get("demo_scenario")
-            if raw_demo_scenario is not None and self._is_well_formed_state(
-                raw_demo_scenario, require_allowed_packages=False
-            ):
+            if raw_demo_scenario is not None:
+                if not self._is_well_formed_state(
+                    raw_demo_scenario, require_allowed_packages=False
+                ):
+                    raise ValueError("Invalid demo scenario payload.")
                 self.demo_scenario = {
-                    str(package_name): str(package_version)
-                    for package_name, package_version in raw_demo_scenario.items()
+                    str(package_name).strip(): str(package_version).strip()
+                    for package_name, package_version in sorted(raw_demo_scenario.items())
                 }
 
             raw_level_descriptions = state_dict.get("level_descriptions", {})
-            if isinstance(raw_level_descriptions, dict):
+            if raw_level_descriptions is not None:
+                if not isinstance(raw_level_descriptions, dict):
+                    raise ValueError("level_descriptions must be a dictionary.")
                 self.level_descriptions = {
                     str(level_name): str(description)
                     for level_name, description in raw_level_descriptions.items()
@@ -1967,8 +2354,26 @@ class NPMResolverEnv:
                     self.minimal_step_bonus_per_remaining_step,
                 )
             )
+            self.minimum_package_count = max(
+                2, int(state_dict.get("minimum_package_count", self.minimum_package_count))
+            )
+            self.repeat_state_penalty = int(
+                state_dict.get("repeat_state_penalty", self.repeat_state_penalty)
+            )
+            self.cycle_termination_threshold = max(
+                2,
+                int(
+                    state_dict.get(
+                        "cycle_termination_threshold",
+                        self.cycle_termination_threshold,
+                    )
+                ),
+            )
             self.fatal_penalty = int(
                 state_dict.get("fatal_penalty", self.fatal_penalty)
+            )
+            self.cycle_message = str(
+                state_dict.get("cycle_message", self.cycle_message)
             )
             self.debug = bool(state_dict.get("debug", self.debug))
             raw_logs = state_dict.get("debug_logs", [])
@@ -2045,28 +2450,56 @@ class NPMResolverEnv:
             )
             self.episode_done = bool(state_dict.get("episode_done", False))
             self.episode_status = str(state_dict.get("episode_status", "in_progress"))
-            self._episode_metrics_committed = self.episode_done
+            self._episode_metrics_committed = bool(
+                state_dict.get("_episode_metrics_committed", self.episode_done)
+            )
 
             raw_state = state_dict.get("current_state", {})
-            self.current_state = (
-                dict(raw_state) if self._is_valid_state(raw_state) else {}
-            )
+            if not self._is_valid_state(raw_state):
+                raise ValueError("Invalid current_state payload.")
+            self.current_state = {
+                str(package_name).strip(): str(package_version).strip()
+                for package_name, package_version in sorted(raw_state.items())
+            }
 
             raw_action = state_dict.get("last_action")
             if isinstance(raw_action, dict):
-                try:
-                    self.last_action = Action.from_json(raw_action)
-                except (TypeError, ValueError):
-                    self.last_action = None
+                self.last_action = Action.from_json(raw_action)
             else:
                 self.last_action = None
 
+            raw_visited_state_counts = state_dict.get("visited_state_counts")
+            raw_last_state_hash = state_dict.get("last_state_hash")
+            self._initialize_state_tracking(
+                self.current_state,
+                visited_state_counts=(
+                    raw_visited_state_counts
+                    if isinstance(raw_visited_state_counts, dict)
+                    else None
+                ),
+                last_state_hash=(
+                    str(raw_last_state_hash)
+                    if raw_last_state_hash is not None
+                    else None
+                ),
+            )
+
             self.last_error_log = self._safe_current_error_log()
             self.last_error_count = self._count_errors(self.last_error_log)
+            if self.episode_done and self.last_error_count == 0:
+                self.episode_status = "success"
             return self._build_observation(self.last_error_log)
         except Exception as exc:
+            self._restore_runtime_snapshot(snapshot)
+            if not self._is_valid_state(self.current_state):
+                self.current_state = self._get_safe_fallback_state()
+                self._initialize_state_tracking(self.current_state)
+                self.last_error_log = self._safe_current_error_log()
+                self.last_error_count = self._count_errors(self.last_error_log)
+                self.episode_done = False
+                self.episode_status = "failed"
             self._log_debug(f"from_dict exception: {exc!r}")
-            return self.reset()
+            return self._build_observation(self.last_error_log)
 
     def reset(self) -> Observation:
         """Start a new episode from the current curriculum level.
@@ -2095,12 +2528,11 @@ class NPMResolverEnv:
                 self._log_debug("Selected scenario was invalid; fell back to level_1.")
             return self._start_episode(selected_scenario, self.current_level)
         except Exception as exc:
-            self.current_state = {}
+            self.current_state = self._get_safe_fallback_state()
             self.last_action = None
-            self.last_error_log = self._format_error(
-                "FATAL", "Reset failed; environment recovered safely."
-            )
-            self.last_error_count = 0
+            self._initialize_state_tracking(self.current_state)
+            self.last_error_log = self._safe_current_error_log()
+            self.last_error_count = self._count_errors(self.last_error_log)
             self.episode_done = False
             self.episode_status = "failed"
             self._log_debug(f"Reset exception: {exc!r}")
@@ -2155,19 +2587,7 @@ class NPMResolverEnv:
             performs an immutable transition, computes reward, checks success, and
             always returns a stable OpenEnv-compatible result.
         """
-        state_snapshot = (
-            dict(self.current_state) if self._is_valid_state(self.current_state) else {}
-        )
-        last_error_log_snapshot = self.last_error_log
-        last_error_count_snapshot = self.last_error_count
-        success_count_snapshot = self.success_count
-        level_success_streak_snapshot = self.level_success_streak
-        current_level_snapshot = self.current_level
-        active_level_snapshot = self.active_level
-        episode_done_snapshot = self.episode_done
-        episode_status_snapshot = self.episode_status
-        last_action_snapshot = self.last_action
-
+        snapshot = self._capture_runtime_snapshot()
         try:
             if self.episode_done:
                 observation = self._build_observation(self.last_error_log)
@@ -2177,28 +2597,32 @@ class NPMResolverEnv:
                 )
                 return observation, 0, True, info
 
-            self.step_count += 1
-            old_error_count = self.last_error_count
-
-            timeout_reached = self.step_count >= self.max_steps
-
             if not self._is_valid_state(self.current_state):
-                self.current_state = {}
+                self.current_state = self._get_safe_fallback_state()
+                self._initialize_state_tracking(self.current_state)
                 self.last_action = None
                 self._log_debug("Detected invalid current_state before applying action.")
+                safe_error_log = self._safe_current_error_log()
+                safe_error_count = self._count_errors(safe_error_log)
                 return self._finalize_transition(
-                    error_log=self._format_error("FATAL", "Invalid dependency state."),
+                    error_log=safe_error_log,
                     reward=self.fatal_penalty,
                     done=True,
                     status="failed",
                     action=None,
-                    errors_remaining=0,
-                    old_error_count=old_error_count,
-                    new_error_count=0,
+                    errors_remaining=safe_error_count,
+                    old_error_count=self.last_error_count,
+                    new_error_count=safe_error_count,
                 )
+
+            working_state = dict(self.current_state)
+            working_step_count = self.step_count + 1
+            old_error_count = self.last_error_count
+            timeout_reached = working_step_count >= self.max_steps
 
             validation_error = self._validate_action_instance(action)
             if validation_error is not None:
+                self.step_count = working_step_count
                 self.last_action = None
                 self._log_debug(f"Rejected action during validation: {validation_error}")
                 return self._finalize_invalid_action(
@@ -2208,48 +2632,50 @@ class NPMResolverEnv:
                     timeout_reached=timeout_reached,
                 )
 
-            self.last_action = Action(
+            normalized_action = Action(
                 package_to_update=action.package_to_update.strip(),
                 new_version=action.new_version.strip(),
             )
+            self.step_count = working_step_count
+            self.last_action = normalized_action
 
-            if self.last_action.package_to_update not in self.current_state:
+            if normalized_action.package_to_update not in working_state:
                 self._log_debug(
-                    f"Rejected unknown package '{self.last_action.package_to_update}'."
+                    f"Rejected unknown package '{normalized_action.package_to_update}'."
                 )
                 return self._finalize_invalid_action(
                     error_log=self._format_error("Error", "Package not found."),
-                    action=self.last_action,
+                    action=normalized_action,
                     old_error_count=old_error_count,
                     timeout_reached=timeout_reached,
                 )
 
-            if not self._is_valid_version_format(self.last_action.new_version):
+            if not self._is_valid_version_format(normalized_action.new_version):
                 self._log_debug(
-                    f"Rejected invalid version '{self.last_action.new_version}'."
+                    f"Rejected invalid version '{normalized_action.new_version}'."
                 )
                 return self._finalize_invalid_action(
                     error_log=self._format_error("Error", "Invalid version format."),
-                    action=self.last_action,
+                    action=normalized_action,
                     old_error_count=old_error_count,
                     timeout_reached=timeout_reached,
                 )
 
-            registry_error = self._validate_registry_version(self.last_action)
+            registry_error = self._validate_registry_version(normalized_action)
             if registry_error is not None:
                 self._log_debug(
-                    f"Rejected unknown version '{self.last_action.new_version}' for "
-                    f"package '{self.last_action.package_to_update}'."
+                    f"Rejected unknown version '{normalized_action.new_version}' for "
+                    f"package '{normalized_action.package_to_update}'."
                 )
                 return self._finalize_invalid_action(
                     error_log=registry_error,
-                    action=self.last_action,
+                    action=normalized_action,
                     old_error_count=old_error_count,
                     timeout_reached=timeout_reached,
                 )
 
             next_state, transition_error = self._apply_action_to_state(
-                self.current_state, self.last_action
+                working_state, normalized_action
             )
             if transition_error is not None:
                 self._log_debug(f"Transition blocked: {transition_error}")
@@ -2260,7 +2686,7 @@ class NPMResolverEnv:
                         reward=self.fatal_penalty,
                         done=True,
                         status="failed",
-                        action=self.last_action,
+                        action=normalized_action,
                         errors_remaining=old_error_count,
                         old_error_count=old_error_count,
                         new_error_count=old_error_count,
@@ -2268,28 +2694,43 @@ class NPMResolverEnv:
 
                 return self._finalize_invalid_action(
                     error_log=transition_error,
-                    action=self.last_action,
+                    action=normalized_action,
                     old_error_count=old_error_count,
                     timeout_reached=timeout_reached,
                 )
 
-            self.current_state = next_state or {}
-            error_log = self._safe_current_error_log()
+            if next_state is None or not self._is_valid_state(next_state):
+                raise ValueError("Validated transition produced an invalid state.")
+
+            next_state = dict(sorted(next_state.items()))
+            error_log = self._generate_error_log(next_state)
             new_error_count = self._count_errors(error_log)
-            state_changed = next_state != state_snapshot
-            deletion_performed = self.last_action.new_version == "DELETE"
+            state_changed = next_state != working_state
+            deletion_performed = normalized_action.new_version == "DELETE"
+            next_state_hash = self._state_hash(next_state)
+            next_state_visit_count = self.visited_state_counts.get(next_state_hash, 0) + 1
+            repeated_state = next_state_visit_count > 1
+            cycle_detected = (
+                repeated_state
+                and next_state_visit_count >= self.cycle_termination_threshold
+            )
 
             done = False
             status = "in_progress"
             success = new_error_count == 0
+            final_error_log = error_log
 
+            self.current_state = next_state
+            self._record_state_visit(self.current_state)
             reward = self._compute_transition_reward(
                 old_error_count=old_error_count,
                 new_error_count=new_error_count,
                 state_changed=state_changed,
                 deletion_performed=deletion_performed,
+                repeated_state=repeated_state,
+                state_visit_count=next_state_visit_count,
                 success=success,
-                timeout_reached=timeout_reached and not success,
+                timeout_reached=timeout_reached and not success and not cycle_detected,
             )
 
             if success:
@@ -2298,48 +2739,51 @@ class NPMResolverEnv:
                 self.success_count += 1
                 self.level_success_streak += 1
                 self._advance_level_if_ready()
+            elif cycle_detected:
+                done = True
+                status = "cycle"
+                final_error_log = self._compose_cycle_log(error_log)
             elif timeout_reached:
                 done = True
                 status = "timeout"
-                error_log = self._compose_timeout_log(error_log)
+                final_error_log = self._compose_timeout_log(error_log)
 
             self._log_debug(
-                f"Applied action {self.last_action} with reward {reward}; "
-                f"errors {old_error_count} -> {new_error_count}."
+                f"Applied action {normalized_action} with reward {reward}; "
+                f"errors {old_error_count} -> {new_error_count}; "
+                f"state visits={next_state_visit_count}."
             )
             return self._finalize_transition(
-                error_log=error_log,
+                error_log=final_error_log,
                 reward=reward,
                 done=done,
                 status=status,
-                action=self.last_action,
+                action=normalized_action,
                 errors_remaining=new_error_count,
                 old_error_count=old_error_count,
                 new_error_count=new_error_count,
             )
         except Exception as exc:
-            self.current_state = state_snapshot
-            self.last_error_log = last_error_log_snapshot
-            self.last_error_count = last_error_count_snapshot
-            self.success_count = success_count_snapshot
-            self.level_success_streak = level_success_streak_snapshot
-            self.current_level = current_level_snapshot
-            self.active_level = active_level_snapshot
-            self.episode_done = episode_done_snapshot
-            self.episode_status = episode_status_snapshot
-            self.last_action = last_action_snapshot
+            self._restore_runtime_snapshot(snapshot)
+            if not self._is_valid_state(self.current_state):
+                self.current_state = self._get_safe_fallback_state()
+                self._initialize_state_tracking(self.current_state)
+                self.last_error_log = self._safe_current_error_log()
+                self.last_error_count = self._count_errors(self.last_error_log)
+                self.episode_done = False
+                self.episode_status = "failed"
             self._log_debug(f"Step exception recovered safely: {exc!r}")
+            safe_error_log = self._safe_current_error_log()
+            safe_error_count = self._count_errors(safe_error_log)
             return self._finalize_transition(
-                error_log=self._format_error(
-                    "FATAL", "Internal environment failure recovered safely."
-                ),
+                error_log=safe_error_log,
                 reward=self.fatal_penalty,
                 done=True,
                 status="failed",
-                action=self.last_action,
-                errors_remaining=self.last_error_count,
+                action=None,
+                errors_remaining=safe_error_count,
                 old_error_count=self.last_error_count,
-                new_error_count=self.last_error_count,
+                new_error_count=safe_error_count,
             )
 
     def register_package_versions(
@@ -2386,6 +2830,7 @@ class NPMResolverEnv:
 
         self.registry[package_name.strip()] = normalized_versions
         self._refresh_cached_metadata()
+        self._repair_runtime_state_if_needed()
 
     def add_curriculum_scenario(self, level_name: str, scenario: Dict[str, str]) -> None:
         """Add a new deterministic scenario to a curriculum level.
@@ -2415,6 +2860,7 @@ class NPMResolverEnv:
 
         self.levels[validated_level].append(dict(scenario))
         self._refresh_cached_metadata()
+        self._repair_runtime_state_if_needed()
 
 
 def _run_interface_validation() -> None:
@@ -2556,6 +3002,98 @@ def _run_metrics_validation() -> None:
     )
 
 
+def _run_safety_validation() -> None:
+    """Run deterministic adversarial safety checks against the environment.
+
+    Inputs:
+        None.
+
+    Outputs:
+        None.
+
+    Behavior:
+        Uses assertions to verify invariant enforcement, cycle handling,
+        serialization rollback, core-package protection, and malformed-input
+        resilience under adversarial usage.
+    """
+    env = NPMResolverEnv()
+    env.current_level = "level_1"
+    env.reset()
+
+    invalid_state_before = dict(env.current_state)
+    invalid_obs, invalid_reward, invalid_done, invalid_info = env.step(None)  # type: ignore[arg-type]
+    assert isinstance(invalid_obs, Observation)
+    assert invalid_reward == -5
+    assert invalid_done
+    assert invalid_info["status"] == "failed"
+    assert env.current_state == invalid_state_before
+
+    core_delete_env = NPMResolverEnv()
+    core_delete_env.current_level = "level_1"
+    core_delete_env.reset()
+    _, core_delete_reward, core_delete_done, core_delete_info = core_delete_env.step(
+        Action(package_to_update="react", new_version="DELETE")
+    )
+    assert core_delete_done
+    assert core_delete_reward == core_delete_env.fatal_penalty
+    assert core_delete_info["status"] == "failed"
+
+    unknown_version_env = NPMResolverEnv()
+    unknown_version_env.current_level = "level_1"
+    unknown_version_env.reset()
+    _, unknown_reward, unknown_done, unknown_info = unknown_version_env.step(
+        Action(package_to_update="react", new_version="^99.0.0")
+    )
+    assert unknown_done
+    assert unknown_reward == unknown_version_env.invalid_action_penalty
+    assert unknown_info["status"] == "failed"
+
+    cycle_env = NPMResolverEnv()
+    cycle_env.current_level = "level_1"
+    cycle_env.reset()
+    _, _, first_noop_done, _ = cycle_env.step(
+        Action(package_to_update="react", new_version="^17.0.0")
+    )
+    assert not first_noop_done
+    _, cycle_reward, cycle_done, cycle_info = cycle_env.step(
+        Action(package_to_update="react", new_version="^17.0.0")
+    )
+    assert cycle_done
+    assert cycle_info["status"] == "cycle"
+    assert cycle_reward < 0
+
+    round_trip_env = NPMResolverEnv()
+    round_trip_env.current_level = "level_2"
+    round_trip_env.reset()
+    round_trip_snapshot = round_trip_env.to_dict()
+    round_trip_copy = NPMResolverEnv()
+    round_trip_copy.from_dict(round_trip_snapshot)
+    assert round_trip_copy.to_dict()["current_state"] == round_trip_snapshot["current_state"]
+
+    corrupted_restore_env = NPMResolverEnv()
+    corrupted_restore_env.current_level = "level_2"
+    corrupted_restore_env.reset()
+    corrupted_state_before = dict(corrupted_restore_env.current_state)
+    corrupted_restore_env.from_dict({"current_state": {"react": "^17.0.0"}})
+    assert corrupted_restore_env.current_state == corrupted_state_before
+    assert corrupted_restore_env._is_valid_state(corrupted_restore_env.current_state)
+
+    regression_cycle_env = NPMResolverEnv()
+    regression_cycle_env.current_level = "level_3"
+    regression_cycle_env.reset()
+    _, progress_reward, progress_done, _ = regression_cycle_env.step(
+        Action(package_to_update="react-router-dom", new_version="6.0.0")
+    )
+    assert progress_reward > 0
+    assert not progress_done
+    _, regression_reward, regression_done, regression_info = regression_cycle_env.step(
+        Action(package_to_update="react-router-dom", new_version="5.0.0")
+    )
+    assert regression_reward < 0
+    assert not regression_done
+    assert regression_info["status"] == "in_progress"
+
+
 def _run_demo_validation() -> None:
     """Run a simple fixed demo episode and print the structured trace.
 
@@ -2586,4 +3124,5 @@ def _run_demo_validation() -> None:
 if __name__ == "__main__":
     _run_interface_validation()
     _run_metrics_validation()
+    _run_safety_validation()
     _run_demo_validation()
