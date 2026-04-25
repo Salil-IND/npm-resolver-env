@@ -1,6 +1,4 @@
 name: "auto-resolve-npm"
 version: "1.0.0"
 description: "An RL environment for resolving Node.js peerDependency conflicts."
-environment:
-  # This tells OpenEnv to look in environment.py for the NPMResolverEnv class
-  entrypoint: "environment:NPMResolverEnv"
+entrypoint: "environment:NPMResolverEnv"
