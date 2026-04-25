@@ -190,7 +190,7 @@ class NPMResolverEnv:
         self.success_message = "SUCCESS: Audited packages in 0.01s. No vulnerabilities found."
         self.timeout_message = "TIMEOUT: Maximum steps reached without resolution."
         self.step_penalty = -1
-        self.progress_reward_per_error = 8
+        self.progress_reward_per_error = 10
         self.regression_penalty_per_error = 10
         self.stalled_progress_penalty = 0
         self.no_op_penalty = -2
@@ -198,7 +198,7 @@ class NPMResolverEnv:
         self.deletion_penalty = -6
         self.timeout_penalty = -10
         self.timeout_reward_cap = -1
-        self.success_reward = 60
+        self.success_reward = 50
         self.fatal_penalty = -100
         self.registry = {
             "react-dom": {
