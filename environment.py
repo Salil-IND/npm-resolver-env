@@ -1305,7 +1305,7 @@ class NPMResolverEnv:
             allowed step, and preserves the unresolved environment state.
         """
         reward = self.invalid_action_penalty
-        done = False
+        done = True
         status = "failed"
         final_error_log = error_log
 
