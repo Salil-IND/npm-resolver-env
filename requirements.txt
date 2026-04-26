@@ -1,0 +1,4 @@
+unsloth
+gradio
+torch
+transformers
