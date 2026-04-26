@@ -79,44 +79,43 @@ class NPMResolverEnv:
     # ------ registry mock ------
     MOCK_REGISTRY: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {
         "react-dom": {
-            "^16.8.0": {"requires": {"react": "^16.8.0"}},
             "^17.0.0": {"requires": {"react": "^17.0.0"}},
             "^18.0.0": {"requires": {"react": "^18.0.0"}},
         },
         "react-router-dom": {
-            "5.0.0": {"requires": {"react": "^16.8.0", "react-dom": "^16.8.0"}},
             "6.0.0": {"requires": {"react": "^18.0.0", "react-dom": "^18.0.0"}},
         },
-        "framer-motion": {
-            "4.0.0":  {"requires": {"react": "^17.0.0"}},
-            "10.0.0": {"requires": {"react": "^18.0.0"}},
+        "mongoose": {
+            "6.0.0": {"requires": {"mongodb": "^4.0.0"}},
+            "7.0.0": {"requires": {"mongodb": "^5.0.0"}},
         },
+        "express-session": {
+            "1.17.0": {"requires": {"express": "^4.0.0"}},
+        },
+        "babel-loader": {
+            "8.0.0": {"requires": {"webpack": "^4.0.0", "@babel/core": "^7.0.0"}},
+            "9.0.0": {"requires": {"webpack": "^5.0.0", "@babel/core": "^7.0.0"}},
+        },
+        "vuex": {
+            "3.0.0": {"requires": {"vue": "^2.0.0"}},
+            "4.0.0": {"requires": {"vue": "^3.0.0"}},
+        }
     }
 
     # ------ curriculum scenarios ------
     SCENARIOS = {
         "level_1": [
             {"react": "^17.0.0", "react-dom": "^18.0.0"},
-            {"react": "^18.0.0", "react-dom": "^17.0.0"},
+            {"mongodb": "^4.0.0", "mongoose": "7.0.0"},
+            {"vue": "^2.0.0", "vuex": "4.0.0"}
         ],
         "level_2": [
             {"react": "^17.0.0", "react-dom": "^17.0.0", "react-router-dom": "6.0.0"},
-            {"react": "^17.0.0", "react-dom": "^18.0.0", "react-router-dom": "6.0.0"},
-            {"react": "^17.0.0", "react-dom": "^17.0.0", "framer-motion": "10.0.0"},
+            {"webpack": "^4.0.0", "@babel/core": "^7.0.0", "babel-loader": "9.0.0"},
         ],
         "level_3": [
-            {
-                "react": "^18.0.0", "react-dom": "^18.0.0",
-                "react-router-dom": "5.0.0", "framer-motion": "4.0.0",
-            },
-            {
-                "react": "^17.0.0", "react-dom": "^17.0.0",
-                "react-router-dom": "6.0.0", "framer-motion": "10.0.0",
-            },
-            {
-                "react": "^18.0.0", "react-dom": "^17.0.0",
-                "react-router-dom": "5.0.0", "framer-motion": "10.0.0",
-            },
+            {"webpack": "^4.0.0", "@babel/core": "^6.0.0", "babel-loader": "9.0.0"},
+            {"express": "^3.0.0", "express-session": "1.17.0", "mongodb": "^4.0.0", "mongoose": "7.0.0"}
         ],
     }
 
@@ -459,12 +458,14 @@ class NPMResolverEnv:
 if __name__ == "__main__":
     print("=== Robust NPMResolverEnv self‑test ===")
 
-    env = NPMResolverEnv(training_mode=True, max_steps=10)
+    # Using training_mode=False ensures we reliably test the Level 1 'react' scenario 
+    # instead of randomly hitting a 'vue' or 'mongoose' scenario and failing the assertions.
+    env = NPMResolverEnv(training_mode=False, max_steps=10)
     obs = env.reset()
     print("Initial state:", obs.current_package_json[:80], "...")
 
     # Test 1: invalid format
-    _, r, d, info = env.step(Action("framer-motion", "garbage"))
+    _, r, d, info = env.step(Action("react-dom", "garbage"))
     assert r == env.INVALID_ACTION_PENALTY and d == False
     print("[PASS] Invalid version penalised correctly.")
 
@@ -474,14 +475,14 @@ if __name__ == "__main__":
     print("[PASS] Unknown package penalised correctly.")
 
     # Test 3: core delete
-    env2 = NPMResolverEnv(training_mode=True)
+    env2 = NPMResolverEnv(training_mode=False)
     env2.reset()
     obs3, r3, d3, info3 = env2.step(Action("react", "DELETE"))
     assert r3 == env.FATAL_PENALTY and d3 == True
     print("[PASS] Core deletion triggers fatal penalty.")
 
     # Test 4: success trajectory
-    env3 = NPMResolverEnv(training_mode=True)
+    env3 = NPMResolverEnv(training_mode=False)
     env3.reset()
     obs4, r4, d4, _ = env3.step(Action("react", "^18.0.0"))
     # after this step, remaining conflicts may require react-dom bump -> need at least 2 steps
